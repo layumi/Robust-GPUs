@@ -6,6 +6,7 @@ sudo nvidia-smi -pm 1 # enable persistance mode
 sudo nvidia-smi -pl 200  # set to 200W
 ```
 
+If you want to retain this setting, you may add these two lines to `etc/rc.local`
 ### Change Fan
 
 
