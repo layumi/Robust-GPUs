@@ -19,7 +19,7 @@ https://ubuntuforums.org/showthread.php?t=2380735
 ```
 cd /etc/X11
 sudo nvidia-xconfig --enable-all-gpus
-nvidia-xconfig --cool-bits=12
+sudo nvidia-xconfig --cool-bits=12
 ```
 https://wiki.archlinux.org/index.php/NVIDIA/Tips_and_tricks#Set_fan_speed_at_login
 
