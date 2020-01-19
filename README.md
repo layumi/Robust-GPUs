@@ -29,3 +29,9 @@ https://wiki.archlinux.org/index.php/NVIDIA/Tips_and_tricks#Set_fan_speed_at_log
 - https://github.com/boris-dimitrov/set_gpu_fans_public
 
 - https://tutorials.technology/tutorials/86-How-to-adjust-NVIDIA-GPU-power-usage-on-linux.html
+
+
+### Vim Color 
+```
+echo "hi comment ctermbg=4 ctermfg=6" >> ~/.vimrc
+```
