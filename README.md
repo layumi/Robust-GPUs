@@ -1,5 +1,11 @@
 Code contains risk!
 
+https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
+### FAN controal 
+```
+sudo nvidia-xconfig -a --cool-bits=28 --allow-empty-initial-configuration
+```
+
 ### Change GPU Power
 ```
 sudo nvidia-smi -pm 1 # enable persistance mode
