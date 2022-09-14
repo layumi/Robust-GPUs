@@ -12,6 +12,11 @@ sudo nvidia-smi -pm 1 # enable persistance mode
 sudo nvidia-smi -pl 200  # set to 200W
 ```
 
+### Auto-boost clock 
+```
+sudo nvidia-smi --auto-boost-default=ENABLED -i 0
+```
+
 If you want to retain this setting, you may add these two lines to `etc/rc.local`
 ### Change Fan
 
