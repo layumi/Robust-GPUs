@@ -1,7 +1,14 @@
 Code contains risk!
 
 https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
-### FAN controal 
+
+### CPU Memory Control
+160GB limited.
+```
+ ulimit -m 160000000
+```
+
+### FAN control 
 ```
 sudo nvidia-xconfig -a --cool-bits=28 --allow-empty-initial-configuration
 ```
