@@ -2,6 +2,18 @@ Code contains risk!
 
 https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
 
+### bash setting
+```
+# set PATH for cuda 12.2 installation
+export PATH=/usr/local/cuda-12.2/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda-12.2/includei:/usr/include/:${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+export CUDA_PATH=/usr/local/cuda-12.2
+export CUDA_ROOT=/usr/local/cuda-12.2
+export CUDA_HOME=/usr/local/cuda-12.2
+export CUDA_HOST_COMPILER=/usr/bin/gcc
+```
+
 ### CPU Memory Control
 160GB limited.
 ```
