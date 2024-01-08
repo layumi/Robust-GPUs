@@ -14,6 +14,14 @@ export CUDA_HOME=/usr/local/cuda-12.2
 export CUDA_HOST_COMPILER=/usr/bin/gcc
 ```
 
+https://askubuntu.com/questions/1340946/nvidia-rtx-3070-eth-overclock-in-ubuntu20-04-nvidia-settings-a-gpugraphicscloc 
+### GPU Clock
+```
+sudo DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 nvidia-settings -a '[gpu:1]/GPUMemoryTransferRateOffsetAllPerformanceLevels=1000'
+sudo DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 nvidia-settings -a '[gpu:1]/GPUGraphicsClockOffsetAllPerformanceLevels=200'
+```
+
+
 ### CPU Memory Control
 160GB limited.
 ```
