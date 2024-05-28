@@ -2,6 +2,11 @@ Code contains risk!
 
 https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
 
+### tmux setting 
+```bash
+echo "set -g history-limit 5000" >> ~/.tmux.conf
+```
+
 ### bash setting
 ```
 # set PATH for cuda 12.2 installation
