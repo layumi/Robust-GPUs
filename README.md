@@ -4,10 +4,10 @@ https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-i
 
 ### enlarge swap with 16GB
 ```
-sudo fallocate -l 16G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
+sudo fallocate -l 16G /swapfile1
+sudo chmod 600 /swapfile1
+sudo mkswap /swapfile1
+sudo swapon /swapfile1
 ```
 
 ### tmux setting 
