@@ -2,6 +2,14 @@ Code contains risk!
 
 https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
 
+### enlarge swap with 16GB
+```
+sudo fallocate -l 16G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+```
+
 ### tmux setting 
 ```bash
 echo "set -g history-limit 5000" >> ~/.tmux.conf
