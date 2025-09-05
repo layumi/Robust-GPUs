@@ -10,6 +10,11 @@ sudo mkswap /swapfile1
 sudo swapon /swapfile1
 ```
 
+### set memory limits for every user
+```
+sudo ./set_memlimit.sh 60G
+```
+
 ### tmux setting 
 ```bash
 echo "set -g history-limit 5000" >> ~/.tmux.conf
