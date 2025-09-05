@@ -12,7 +12,7 @@ sudo swapon /swapfile1
 
 ### set memory limits for every user
 ```
-sudo ./set_memlimit.sh 60G
+sudo bash ./set_memlimit.sh 60G
 ```
 
 ### tmux setting 
