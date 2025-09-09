@@ -2,6 +2,14 @@ Code contains risk!
 
 https://www.techticity.com/howto/how-to-control-nvidia-graphics-card-fan-speed-in-linux/ 
 
+
+### install
+```
+sudo apt install aria2
+sudo apt install zip
+sudo apt install docker #need update
+```
+
 ### enlarge swap with 32GB
 ```
 sudo fallocate -l 32G /swapfile1
