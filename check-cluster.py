@@ -13,6 +13,7 @@ target_users = {
     "曾家瑞": "mc56750",
     "李亚轩": "yaxuanli",
     "方云松": "mc45296",
+    "许伟峰": "mc56486",
     "mingyang": "mc45294",
     "ruiyang": "yc47931",
     "juhao": "yc47429",
