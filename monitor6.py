@@ -38,6 +38,7 @@ target_users = {
     "mingyang": "mc45294",
     "ruiyang": "yc47931",
     "juhao": "yc47429",
+    "zdzheng": "zhedongz",
 }
 
 # Cache settings
@@ -97,10 +98,7 @@ def get_squeue_output():
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(cluster_host, username='zhedongzheng', timeout=10)
         
-        user_list = ','.join(target_users.values())
-        command = f'squeue -u {user_list} -o "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"'
-        
-        stdin, stdout, stderr = client.exec_command(command)
+        stdin, stdout, stderr = client.exec_command('/home/user/zhedongzheng/miniconda3/bin/python check_squeue_users.py')
         output = stdout.read().decode().strip()
         error = stderr.read().decode().strip()
         
@@ -130,16 +128,17 @@ def parse_squeue_for_users(output, target_users):
     counter = Counter()
     if not output:
         return counter
-    
+
     lines = output.strip().split("\n")
     for line in lines[1:]:  # Skip header
         parts = line.split()
-        if len(parts) >= 4:  # USER in 4th column
-            user = parts[3]
+        if len(parts) >= 3:  # USER in 2nd column
+            user = parts[1]
             for name, uid in target_users.items():
                 if user == uid:
-                    counter[(name, uid)] += 1
+                    counter[(name, uid)] = int(parts[2]) # num in 3rd column
     return counter
+
 
 def get_squeue_status():
     output, error = get_squeue_output()
