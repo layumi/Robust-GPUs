@@ -309,6 +309,58 @@ def monitor():
                 user_jobs.append(f"{name} ({userid}): {count}")
         user_jobs_str = ", ".join(user_jobs) if user_jobs else "None"
         html += f'<p>Total jobs: {total_jobs} ({user_jobs_str})</p>'
+
+    # --- Add resource table---
+    html += """
+    <h2>Cluster Information</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Partition Name</th>
+                <th>Number of GPU in total</th>
+                <th>GPU</th>
+                <th>Time limit</th>
+                <th>Partition QOS</th>
+                <th>QOS</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>gbunchQ</td>
+                <td>12</td>
+                <td>A40 48GB PCIE</td>
+                <td>3 days</td>
+                <td>4 GPUs pre user simultaneously</td>
+                <td>- Each PI group can occupy maximum 6 GPUs simultaneously<br>- Each user can occupy maximum 4 GPUs simultaneously<br>- Each user can only run 2 jobs, and submit 4 jobs simultaneously</td>
+            </tr>
+            <tr>
+                <td>gbunchQ1</td>
+                <td>3</td>
+                <td>3090 x2 (fstsvr03)<br>V100 x1 (fstsvr02)</td>
+                <td>7 days</td>
+                <td>4 GPUs pre user simultaneously</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td>gbunchQ2</td>
+                <td>12</td>
+                <td>A100 80GB PCIE</td>
+                <td>2 days</td>
+                <td>4 GPUs pre user simultaneously</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td>gbunchQ3</td>
+                <td>2</td>
+                <td>H800 80GB PCIE</td>
+                <td>2 days</td>
+                <td>1 GPU pre user simultaneously</td>
+                <td></td>
+            </tr>
+        </tbody>
+    </table>
+    """
+
     html += '</div>'
     
     html += """
