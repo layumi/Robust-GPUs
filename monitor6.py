@@ -4,6 +4,7 @@ import paramiko
 from flask import Flask
 from datetime import datetime, timedelta
 import json
+import subprocess
 from collections import Counter
 import logging
 
@@ -14,8 +15,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Machine IPs and corresponding names
-machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.46.65']
-machine_name = ['um1', 'um2', 'um3', 'um5']
+machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.46.65', '10.119.183.78']
+machine_name = ['um1', 'um2', 'um3', 'um5', 'jizheng']
 machine_map = dict(zip(machines, machine_name))
 
 # Cluster for squeue
@@ -54,7 +55,6 @@ def get_gpu_status(host):
     if host not in machines:
         logger.error(f"Invalid host: {host}")
         return f"Error: Invalid host {host}"
-    
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
