@@ -1,5 +1,6 @@
 from gevent import monkey
 monkey.patch_all()
+import gevent # <-- 添加了 GEVENT 导入
 import paramiko
 from flask import Flask
 from datetime import datetime, timedelta
@@ -15,8 +16,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Machine IPs and corresponding names
-machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.46.65', '10.119.183.78']
-machine_name = ['um1', 'um2', 'um3', 'um5', 'jizheng']
+machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.44.40', '10.119.46.65', '10.119.183.78']
+machine_name = ['um1', 'um2', 'um3', 'um4', 'um5', 'jizheng']
 machine_map = dict(zip(machines, machine_name))
 
 # Cluster for squeue
@@ -202,14 +203,49 @@ def get_memory_color(mem_used, mem_total):
 
 @app.route('/')
 def monitor():
-    # Get GPU status for machines
-    status = {}
-    for machine in machines:
-        logger.debug(f"Processing machine: {machine}")
-        status[machine] = get_cached_gpu_status(machine)
+    # --- GEVENT 并行执行 ---
+    # Spawn greenlets for all GPU status checks
+    gpu_jobs = {machine: gevent.spawn(get_cached_gpu_status, machine) for machine in machines}
     
-    # Get squeue status for cluster
-    squeue_status = get_cached_squeue_status()
+    # Spawn a greenlet for the squeue status check
+    squeue_job = gevent.spawn(get_cached_squeue_status)
+    
+    # Combine all jobs to wait for
+    all_jobs = list(gpu_jobs.values()) + [squeue_job]
+    
+    # Wait for all jobs to complete
+    gevent.joinall(all_jobs)
+
+    # Collect GPU status results
+    status = {}
+    for machine, job in gpu_jobs.items():
+        logger.debug(f"Collecting result for machine: {machine}")
+        try:
+            # Check if the job was successful
+            if job.successful():
+                status[machine] = job.value
+            else:
+                # Log the exception if the job failed
+                logger.error(f"Greenlet for {machine} failed: {job.exception}")
+                status[machine] = f"Error (see logs): {job.exception}"
+        except Exception as e:
+            # This is a fallback
+            logger.error(f"Error collecting greenlet result for {machine}: {e}")
+            status[machine] = f"Error collecting result: {e}"
+    
+    # Collect squeue status result
+    squeue_status = None
+    try:
+        if squeue_job.successful():
+            squeue_status = squeue_job.value
+        else:
+            logger.error(f"Greenlet for squeue failed: {squeue_job.exception}")
+            squeue_status = f"Error (see logs): {squeue_job.exception}"
+    except Exception as e:
+        logger.error(f"Error collecting greenlet result for squeue: {e}")
+        squeue_status = f"Error collecting result: {e}"
+    
+    # --- HTML 生成部分 ---
     
     html = """
     <!DOCTYPE html>
@@ -282,7 +318,7 @@ def monitor():
                 mem_used = gpu.get('memory.used', 'N/A')
                 mem_total = gpu.get('memory.total', 'N/A')
                 processes = ', '.join([f"{p.get('username', 'N/A')}:{p.get('pid', 'N/A')}" 
-                                     for p in gpu.get('processes', [])]) or 'None'
+                                      for p in gpu.get('processes', [])]) or 'None'
                 
                 util_color = get_utilization_color(utilization)
                 mem_color = get_memory_color(mem_used, mem_total)
