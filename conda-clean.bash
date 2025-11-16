@@ -7,6 +7,16 @@ for user_dir in /home/*; do
 
         echo "Processing user: $username"
 
+        installer_files_found=$(sudo -u "$username" find "$user_dir" -maxdepth 1 -type f \( -name "Anaconda*.sh" -o -name "Miniconda*.sh" \))
+        
+        if [ -n "$installer_files_found" ]; then
+            echo "找到安装文件: $installer_files_found"
+            sudo -u "$username" find "$user_dir" -maxdepth 1 -type f \( -name "Anaconda*.sh" -o -name "Miniconda*.sh" \) -delete
+            echo "已删除 .sh 安装文件。"
+        else
+            echo "未找到 .sh 安装文件。"
+        fi
+        
         # 检查用户是否安装了 conda
         conda_path="$user_dir/miniconda3/bin/conda"
         if [ ! -f "$conda_path" ]; then
