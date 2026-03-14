@@ -43,6 +43,9 @@ target_users = {
     "ruiyang": "yc47931",
     "juhao": "yc47429",
     "zdzheng": "zhedongz",
+    "feihong": "yc58103",
+    "chenxu": "chenxu",
+    "linzeju":"linzeju",
 }
 
 # Cache settings
