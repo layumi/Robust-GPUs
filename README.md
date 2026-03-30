@@ -10,6 +10,13 @@ sudo apt install zip
 sudo apt install docker #need update
 ```
 
+
+### Avoid Memory Thrashing
+```
+sudo apt install earlyoom
+sudo systemctl enable --now earlyoom
+```
+
 ### enlarge swap with 32GB
 ```
 sudo fallocate -l 128G ./swapfile1
