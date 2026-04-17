@@ -9,6 +9,11 @@ sudo apt install aria2
 sudo apt install zip
 ```
 
+### Mirror
+```
+pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+```
+
 ### Docker
 ```
 sudo install -m 0755 -d /etc/apt/keyrings
