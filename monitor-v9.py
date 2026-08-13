@@ -43,6 +43,7 @@ target_users = {
     "feihong": "yc58103",
     "chenxu": "yc67196",
     "linzeju": "yc67203",
+    "xiji": "mc64693",
 }
 
 ignore_users = {'root', 'admuser', 'ollama', 'user', 'nobody', 'daemon'}
