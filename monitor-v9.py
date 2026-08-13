@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ====================== 配置 ======================
-machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.44.40', '10.119.46.65', '10.119.46.67', '10.119.183.78']
-machine_name = ['um1', 'um2', 'um3', 'um4', 'um5', 'um7', 'jizheng']
+machines = ['10.119.46.58', '10.119.46.59', '10.119.178.21', '10.119.44.40', '10.119.46.65', '10.119.46.67']
+machine_name = ['um1', 'um2', 'um3', 'um4', 'um5', 'um7']
 machine_map = dict(zip(machines, machine_name))
 
 cluster_host = '10.119.48.10'
@@ -36,13 +36,13 @@ target_users = {
     "yaxuan": "yaxuanli",
     "yunsong": "mc45296",
     "weifeng": "mc56486",
-    "mingyang": "mc45294",
+    "mingyang": "yc67382",
     "ruiyang": "yc47931",
     "juhao": "yc47429",
     "zdzheng": "zhedongz",
     "feihong": "yc58103",
-    "chenxu": "chenxu",
-    "linzeju": "linzeju",
+    "chenxu": "yc67196",
+    "linzeju": "yc67203",
 }
 
 ignore_users = {'root', 'admuser', 'ollama', 'user', 'nobody', 'daemon'}
