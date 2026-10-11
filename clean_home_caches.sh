@@ -526,16 +526,17 @@ hf_official_prune() {
   local u="$1"
   # 需要新版 `hf` CLI（huggingface_hub 1.x）。旧版只有交互式 huggingface-cli
   # delete-cache，会挂在 TUI 上等输入，所以这里刻意不去调用它。
-  if ! timeout 15 sudo -u "$u" -H bash -lc 'command -v hf >/dev/null 2>&1' </dev/null; then
+  if ! owner_cmd 15 "$u" bash -lc 'command -v hf >/dev/null 2>&1'; then
     return 0
   fi
   # 关键：hf cache prune 默认是交互式的（Proceed? [y/N]），必须显式加 -y，
   # 否则 </dev/null 读到 EOF 会静默放弃、什么也不做。
+  # 另外 hf 也是 Python，同样受 multiprocessing 的 CWD 问题影响，所以走 safe cwd。
   local out rc
   if [ "$APPLY" -eq 1 ]; then
     # 注意：不能写成 `if cmd | sed ...` —— 管道的退出码是最后一段(sed)的，
     # 会把失败误判成成功。必须先存 $? 再打印。
-    out=$(timeout 1800 sudo -u "$u" -H bash -lc 'hf cache prune --yes' </dev/null 2>&1); rc=$?
+    out=$(owner_cmd 1800 "$u" bash -lc 'hf cache prune --yes' 2>&1); rc=$?
     printf '%s\n' "$out" | sed 's/^/     /'
     if [ "$rc" -eq 0 ]; then
       ok "   · hf cache prune --yes（保留模型，仅删 detached revision + 残片）"
@@ -544,7 +545,7 @@ hf_official_prune() {
     fi
   else
     printf '   %b--%b hf cache prune --dry-run（预览，不删）\n' "$C_DIM" "$C_RST"
-    out=$(timeout 300 sudo -u "$u" -H bash -lc 'hf cache prune --dry-run' </dev/null 2>&1) || true
+    out=$(owner_cmd 300 "$u" bash -lc 'hf cache prune --dry-run' 2>&1) || true
     printf '%s\n' "$out" | head -n 40 | sed 's/^/     /'
   fi
 }
@@ -704,9 +705,95 @@ force_rm_pkgs() {
   rm -rf -- "$p/pkgs" && ok "     已强制删除 $p/pkgs" || err "     删除失败: $p/pkgs"
 }
 
+# 安全的工作目录：所有人可进入，避免下面的 multiprocessing CWD 问题
+CONDA_CWD="/"
+
+# conda / hf 这类 Python 工具内部会用 multiprocessing 起子进程，而 CPython 的
+# spawn 会把【父进程的 CWD】传给子进程并 os.chdir() 过去：
+#     multiprocessing/spawn.py:186   dir=os.getcwd(),
+#     multiprocessing/spawn.py:235   os.chdir(data['dir'])
+# 于是，如果脚本运行时 CWD 是某个 mode 700 的家目录
+#（典型场景：管理员在自己 ~ 下执行 `sudo bash clean_home_caches.sh`），
+# 以【别人】身份运行的子进程 chdir 就会被拒：
+#     PermissionError: [Errno 13] Permission denied: '/home/zhedongzheng'
+# 实测在 4090gpu-01 上，这一条导致 19/22 个 conda 前缀的 conda clean 全部失败，
+# 而报错里提到的目录是管理员的、不是目标用户的 —— 极易误判成"学生的 conda 坏了"。
+# 对策：执行前切到 /。
+owner_cmd() {   # <超时秒> <owner> <cmd...>
+  # 注意：timeout 必须写在 subshell【内部】。写成 `timeout N owner_cmd ...` 是错的，
+  # 因为 timeout 是外部命令，无法调用 shell 函数（这个坑我在本脚本里已经踩过两次）。
+  local t="$1" owner="$2"; shift 2
+  ( cd "$CONDA_CWD" 2>/dev/null || cd /; exec timeout "$t" sudo -u "$owner" -H "$@" </dev/null )
+}
+
+# =============================================================================
+#  conda clean 的执行与诊断
+# =============================================================================
+CONDA_OUT=""       # 最近一次 conda clean 的输出
+CONDA_HOW=""       # 哪一级重试成功的
+CONDA_ERR_LOG=""   # 失败日志落盘路径，在 main 里初始化
+CONDA_PKGS_KB=0    # 所有 conda 前缀的 pkgs 体积合计（用于汇总，避免"0KB"的误导）
+# conda 的 bin/conda、bin/pip 等脚本在创建时会把 python 解释器的【绝对路径】
+# 写死在第一行 shebang 里。目录一旦被 mv 过（很常见：/home/<u>/miniconda3
+# 搬到 /data3/<u>/miniconda3），文件还在但解释器路径已失效，exec 时内核报
+# "No such file or directory" —— 看起来像文件不存在，其实是解释器不存在。
+conda_shebang_ok() {
+  local p="$1" sh interp
+  sh=$(head -n 1 -- "$p/bin/conda" 2>/dev/null) || return 0
+  case "$sh" in '#!'*) ;; *) return 0 ;; esac
+  interp=${sh#\#!}
+  interp=${interp%% *}
+  [ -n "$interp" ] || return 0
+  [ -x "$interp" ]
+}
+
+# conda 崩溃时会把 traceback 打在【最前面】，末尾只是客套话。
+# 之前用 tail -12 只显示了客套话，等于什么都没诊断出来。
+dump_conda_error() {   # $1=前缀 $2=完整输出
+  local p="$1" body="$2" n
+  n=$(printf '%s\n' "$body" | wc -l)
+  # 跳过开头的空行，找到第一行有内容的
+  printf '%s\n' "$body" | awk 'NF{p=1} p' | head -n 18 | sed 's/^/        | /'
+  [ "$n" -gt 20 ] && log "        | …（还有 $((n - 20)) 行，完整日志见 ${CONDA_ERR_LOG}）"
+  if [ -n "$CONDA_ERR_LOG" ]; then
+    {
+      printf '\n===== %s  (属主 %s) =====\n' "$p" "$(stat -c '%U' -- "$p" 2>/dev/null)"
+      printf '%s\n' "$body"
+    } >> "$CONDA_ERR_LOG"
+  fi
+}
+
+# 三级重试：直接执行 -> 关插件 -> 显式指定解释器（绕开失效的 shebang）
+# 返回 0 表示某一级成功，并设置 CONDA_HOW / CONDA_OUT
+try_conda_clean() {
+  local p="$1" owner="$2" out rc
+  CONDA_OUT=""; CONDA_HOW=""
+
+  out=$(owner_cmd 1800 "$owner" "$p/bin/conda" clean --all --yes 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then CONDA_OUT="$out"; CONDA_HOW="直接执行"; return 0; fi
+
+  # conda 自己的崩溃报告就提示了插件可能是元凶，值得照做再试一次
+  out=$(owner_cmd 1800 "$owner" /usr/bin/env CONDA_NO_PLUGINS=true \
+        "$p/bin/conda" clean --all --yes 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then CONDA_OUT="$out"; CONDA_HOW="关插件重试(CONDA_NO_PLUGINS=true)成功"; return 0; fi
+
+  # shebang 失效时，显式用前缀自带的 python 去跑 conda 脚本，绕过内核的 shebang 解析
+  if [ -x "$p/bin/python" ] && ! conda_shebang_ok "$p"; then
+    out=$(owner_cmd 1800 "$owner" "$p/bin/python" "$p/bin/conda" \
+          clean --all --yes 2>&1); rc=$?
+    if [ "$rc" -eq 0 ]; then
+      CONDA_OUT="$out"; CONDA_HOW="显式解释器重试成功(shebang 已失效)"; return 0
+    fi
+  fi
+  CONDA_OUT="$out"
+  return 1
+}
+
 # 全局跑一次：按前缀去重，以【前缀属主】身份执行
 clean_conda_prefixes() {
-  local p owner kb_before kb_after freed out rc
+  local p owner kb_before kb_after freed
+  local -a STUCK=()
+  local STUCK_KB=0
   if [ "${#ORPHAN_PKGS[@]}" -gt 0 ]; then
     for p in "${ORPHAN_PKGS[@]}"; do
       purge_dir "$p/pkgs" "$p" "conda 包缓存（无 conda 可执行文件）"
@@ -721,6 +808,7 @@ clean_conda_prefixes() {
   for p in "${CONDA_PREFIXES[@]}"; do
     owner=$(stat -c '%U' -- "$p" 2>/dev/null || echo root)
     kb_before=$(size_kb "$p/pkgs")
+    CONDA_PKGS_KB=$((CONDA_PKGS_KB + kb_before))
     log "   · $p  (属主: $owner, pkgs $(human "$kb_before"))"
 
     if [ "$APPLY" -ne 1 ]; then
@@ -728,19 +816,23 @@ clean_conda_prefixes() {
       continue
     fi
 
-    # 保留输出用于诊断。以前这里写 >/dev/null 2>&1 然后在警告里猜原因，
-    # 结果 20/23 失败却完全不知道为什么 —— 那是错误做法。
-    out=$(timeout 1800 sudo -u "$owner" -H "$p/bin/conda" clean --all --yes </dev/null 2>&1); rc=$?
-    if [ "$rc" -eq 0 ]; then
-      ok "     conda clean --all --yes 完成"
+    if try_conda_clean "$p" "$owner"; then
+      ok "     conda clean --all --yes 完成${CONDA_HOW:+（${CONDA_HOW}）}"
     else
-      warn "     conda clean 失败 (exit=$rc, 属主 $owner)，原始输出末 12 行:"
-      printf '%s\n' "$out" | tail -n 12 | sed 's/^/        | /'
+      warn "     conda clean 仍失败，属主 ${owner}。以下是最前面的报错（traceback 在头部）:"
+      dump_conda_error "$p" "$CONDA_OUT"
+      if ! conda_shebang_ok "$p"; then
+        err "     ↑ 诊断：$p/bin/conda 的 shebang 指向的解释器已不存在。"
+        err "       该 conda 目录被搬动过（例如从 /home 移到 /data），"
+        err "       conda 命令本身对这个用户已不可用，环境很可能也已失效。"
+        err "       正确做法是让属主重装或修 shebang，而不是只删 pkgs。"
+      fi
       if [ "$FORCE_RM_PKGS" -eq 1 ]; then
         warn "     --force-rm-pkgs 生效：改为直接删 $p/pkgs"
         force_rm_pkgs "$p"
       else
-        log "        如确认要强清：重跑并加 --force-rm-pkgs"
+        STUCK+=("$p")
+        STUCK_KB=$((STUCK_KB + kb_before))
       fi
     fi
 
@@ -750,13 +842,19 @@ clean_conda_prefixes() {
       freed=$((kb_before - kb_after))
       TOTAL_KB=$((TOTAL_KB + freed))
       TOTAL_ITEMS=$((TOTAL_ITEMS + 1))
-      printf '   %bDEL%b %10s  %s/pkgs  (conda clean 回收)\n' \
+      printf '   %bDEL%b %10s  %s/pkgs  (回收)\n' \
              "$C_RED" "$C_RST" "$(human "$freed")" "$p"
     else
-      printf '   %b---%b %10s  %s/pkgs  (conda clean 未回收空间)\n' \
+      printf '   %b---%b %10s  %s/pkgs  (未回收)\n' \
              "$C_DIM" "$C_RST" "$(human "$kb_after")" "$p"
     fi
   done
+
+  if [ "${#STUCK[@]}" -gt 0 ]; then
+    warn " 以下 ${#STUCK[@]} 个前缀的 pkgs 没能回收，累计约 $(human "$STUCK_KB")："
+    printf '   %s\n' "${STUCK[@]}" | sed 's/^/     /'
+    log "   加 --force-rm-pkgs 可强制删；完整报错已写入 ${CONDA_ERR_LOG}"
+  fi
   return 0
 }
 
@@ -905,6 +1003,16 @@ fi
 # 没有数据盘的机器上家目录 conda 就永远不会被清（已实测复现过这个 bug）。
 probe_conda_global
 
+# conda clean 失败时把完整报错落盘（崩溃报告很长，终端里只显示头部）
+if [ "$APPLY" -eq 1 ]; then
+  if [ -w "$PWD" ]; then
+    CONDA_ERR_LOG="$PWD/conda_clean_failures_$(date +%Y%m%d-%H%M%S).log"
+  else
+    CONDA_ERR_LOG="/tmp/conda_clean_failures_$(date +%Y%m%d-%H%M%S).log"
+  fi
+  : > "$CONDA_ERR_LOG" 2>/dev/null || CONDA_ERR_LOG=""
+fi
+
 hdr "conda 统一清理（按安装前缀去重）"
 clean_conda_prefixes
 
@@ -931,6 +1039,21 @@ else
   printf ' %sDRY-RUN%s：%d 个缓存目录，预计可释放约 %s%s%s\n' \
     "$C_YEL" "$C_RST" "$TOTAL_ITEMS" "$C_GRN" "$(human "$TOTAL_KB")" "$C_RST"
   printf ' 确认无误后加 --apply 执行；建议先 -u <单个用户> 复核一遍。\n'
+fi
+
+# conda pkgs 单独报，且【必须】报。
+# 否则会出现"汇总 0KB、但下面躺着 89GB pkgs"这种自相矛盾的输出 —— 实测在
+# 4090gpu-01 上就出现过：缓存清过一轮后汇总显示 0KB，而 conda pkgs 有约 89GB。
+if [ "$CONDA_PKGS_KB" -gt 0 ]; then
+  if [ "$APPLY" -eq 1 ]; then
+    printf ' conda pkgs 合计 %s（%d 个前缀），已在上面按前缀列出回收情况\n' \
+           "$(human "$CONDA_PKGS_KB")" "${#CONDA_PREFIXES[@]}"
+  else
+    printf ' %s注意：上面的数字不含 conda pkgs。%s\n' "$C_YEL" "$C_RST"
+    printf '   conda pkgs 合计 %s%s%s（%d 个前缀），通常是最大的一块；\n' \
+           "$C_GRN" "$(human "$CONDA_PKGS_KB")" "$C_RST" "${#CONDA_PREFIXES[@]}"
+    printf '   conda clean 会回收其中"未被任何 env 引用"的部分，具体多少只有执行后才知道。\n'
+  fi
 fi
 printf '\n 按用户分布：\n'
 for s in "${USER_SUMMARY[@]}"; do
