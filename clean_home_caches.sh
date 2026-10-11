@@ -66,6 +66,15 @@ usage() {
   不加 --apply 一律为 DRY-RUN（只报告，不删除）
 
   -u, --users "u1 u2"   只处理指定用户；可重复书写。默认处理 /home/* 下所有普通账号
+      --skip-user "u1 u2"
+                        排除指定用户；可重复书写。用于某个用户的家目录/挂载卡住时，
+                        跳过它让整轮清理能跑完（实测必要）
+      --hf-home 'T'     额外的 HF 缓存路径模板，%u 替换为用户名，可重复。
+                        例: --hf-home '/data/%u/my_hf'
+      --probe-user-shell
+                        允许跑目标用户的 login shell 去读 $HF_HOME。
+                        【默认关闭】——这一步会 source 别人的 profile，实测两台服务器
+                        都因此在某用户处卡死。默认改用路径约定（家目录 + 数据盘）定位。
       --data-mounts "p1 p2"
                         显式指定数据盘挂载点（默认自动探测，见 --data-mount-prefix）
       --data-mount-prefix P
@@ -105,11 +114,14 @@ EOF
 # ------------------------------- 参数解析 -------------------------------
 APPLY=0; DEEP=0; TRASH=0; SYSTEM=0; NUKE_HF=0; NO_HF_PRUNE=0; HF_OUTSIDE_OK=0; HF_DATASETS=0
 FORCE_RM_PKGS=0
+PROBE_USER_SHELL=0
 SCAN_DATA_DEPTH=0
 DATA_MOUNT_PREFIX="/data"
 declare -a TARGET_USERS=()
 declare -a DATA_MOUNTS_ARG=()
 declare -a CONDA_GLOBS=()
+declare -a HF_HOME_PATTERNS=()
+declare -a SKIP_USERS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -149,6 +161,14 @@ while [ $# -gt 0 ]; do
     --no-hf-prune) NO_HF_PRUNE=1; shift ;;
     --hf-datasets) HF_DATASETS=1; shift ;;
     --force-rm-pkgs) FORCE_RM_PKGS=1; shift ;;
+    --probe-user-shell) PROBE_USER_SHELL=1; shift ;;
+    --hf-home)
+      [ $# -ge 2 ] || { err "选项 $1 缺少参数"; exit 2; }
+      HF_HOME_PATTERNS+=( "$2" ); shift 2 ;;
+    --skip-user)
+      [ $# -ge 2 ] || { err "选项 $1 缺少参数"; exit 2; }
+      # shellcheck disable=SC2206
+      SKIP_USERS+=( $2 ); shift 2 ;;
     --allow-hf-outside-home) HF_OUTSIDE_OK=1; shift ;;
     -y|--apply)    APPLY=1; shift ;;
     -n|--dry-run)  APPLY=0; shift ;;    # 显式预演；也是默认行为，写了更不会手滑
@@ -315,9 +335,19 @@ run_or_dry() {  # run_or_dry "描述" 命令...
 }
 
 user_env() {  # user_env <user> <bash snippet> —— 读该用户的 shell 变量（取最后一行）
-  local u="$1" snip="$2" out
-  out=$(timeout 10 sudo -u "$u" -H bash -lc "$snip" 2>/dev/null) || out=""
-  printf '%s' "$(printf '%s' "$out" | tail -n 1)"
+  # 【为什么写成这么绕】这一步会 source 别人的 login profile，是极易挂住的操作：
+  #   1) 不能用 out=$(...)  —— 那是管道；profile 里起的后台进程会继承 stdout，
+  #      命令替换会一直等 EOF，即使 timeout 已经把子进程杀掉也返回不来。
+  #   2) 必须 </dev/null —— 否则 profile 里一句 `read` 就会等终端输入。
+  #   3) 用 timeout -k：先 SIGTERM，5 秒后 SIGKILL。
+  # 即便如此，若目标路径挂在僵死的 NFS 上（进程处于 D 状态），任何信号都杀不掉，
+  # 所以调用方必须把它当作【可选】步骤 —— 见 collect_hf_candidates。
+  local u="$1" snip="$2" out="" tmp
+  tmp=$(mktemp 2>/dev/null) || { printf ''; return 0; }
+  timeout -k 5 10 sudo -u "$u" -H bash -lc "$snip" </dev/null >"$tmp" 2>/dev/null || true
+  out=$(tail -n 1 "$tmp" 2>/dev/null)
+  rm -f "$tmp"
+  printf '%s' "$out"
 }
 
 # =============================================================================
@@ -366,15 +396,6 @@ clean_ml_caches() {
   fi
 }
 
-# 判断路径是否落在已探测到的数据盘之下
-under_data_mount() {
-  local p="$1" m
-  for m in "${DATA_MOUNTS[@]}"; do
-    case "$p" in "$m"/*) return 0 ;; esac
-  done
-  return 1
-}
-
 # 判断 $1 这段路径是否属于用户 $2：取最近的【已存在】祖先看属主。
 # 用途：区分"用户把缓存正常放到数据盘"和"环境变量异常指向了别人的目录"。
 path_owned_by() {
@@ -385,47 +406,66 @@ path_owned_by() {
   [ "$(stat -c '%U' -- "$q" 2>/dev/null)" = "$u" ]
 }
 
-clean_hf() {
-  local u="$1" home="$2"
-  local hf guard
-  hf=$(user_env "$u" 'printf "%s" "${HF_HOME:-$HOME/.cache/huggingface}"')
-  [ -n "$hf" ] || hf="$home/.cache/huggingface"
+# =============================================================================
+#  HF 缓存根解析
+#
+#  【设计变更 · 重要】以前这里会跑目标用户的 login shell 去读 $HF_HOME：
+#      out=$(timeout 10 sudo -u "$u" -H bash -lc 'echo $HF_HOME')
+#  这是全脚本唯一会执行【别人 profile】的地方，也正是实测中两台服务器都挂住的
+#  位置（4090gpu-01 与另一台都在用户 feihong 处卡在 "-- HuggingFace" 之后）。
+#
+#  现在改为：默认【完全按路径约定】找（家目录 + 数据盘），不碰任何人的 shell。
+#  只有显式加 --probe-user-shell（或旧的 --allow-hf-outside-home）才去读环境变量。
+# =============================================================================
+HF_CANDS=()   # 元素格式 "路径<TAB>白名单根"
 
-  if [ ! -d "$hf" ]; then
-    log "   · 无 HF 缓存 ($hf)"
-    return 0
-  fi
+_hf_cand_add() {   # <路径> <白名单根>；成功加入返回 0
+  local p="$1" root="$2" x
+  [ -n "$p" ] || return 1
+  [ -d "$p" ] || return 1
+  { [ -d "$p/hub" ] || [ -d "$p/xet" ] || [ -d "$p/assets" ] || [ -d "$p/datasets" ]; } || return 1
+  for x in "${HF_CANDS[@]}"; do
+    [ "${x%%$'\t'*}" = "$p" ] && return 1
+  done
+  HF_CANDS+=("$(printf '%s\t%s' "$p" "$root")")
+  return 0
+}
 
-  # HF_HOME 解析结果必须落在该用户家目录之内。
-  # 原因：$HOME 由 `sudo -u <u> -H` 提供，一旦解析异常（sudoers 未开 always_set_home、
-  # profile 里重设 HOME、或环境里残留了别人的 HF_HOME），脚本就会指向一个【外来】的
-  # HF 根目录 —— 那可能是另一个用户甚至共享挂载上的缓存。默认直接拒绝，必须显式加
-  # --allow-hf-outside-home 才动。
-  case "$hf" in
-    "$home"/*) guard="$home" ;;
-    *)
-      if [ "$HF_OUTSIDE_OK" -eq 1 ]; then
-        guard="$hf"
-        warn "   · HF_HOME 在 $home 之外，按 --allow-hf-outside-home 放行: $hf"
-      elif under_data_mount "$hf" && path_owned_by "$hf" "$u"; then
-        # 实测（4090gpu-01, 用户 jiajun）：用户 export HF_HOME=/data/<user>/.cache/huggingface
-        # 把模型缓存放到数据盘，这是【正常配置】而不是异常。只要确认该路径属主就是
-        # 这个用户，就纳入清理；属主不符才拒绝。
-        guard="$hf"
-        log "   · HF_HOME 在数据盘且属主为 ${u}，纳入清理: ${hf}"
+collect_hf_candidates() {
+  local u="$1" home="$2" m g gg p hf
+  HF_CANDS=()
+  # 1) --hf-home 显式模板（%u 会被替换成用户名），白名单根取它自身
+  for g in "${HF_HOME_PATTERNS[@]}"; do
+    gg="${g//%u/$u}"
+    # 故意不加引号：这里就是要做 glob 展开
+    # shellcheck disable=SC2086
+    for p in $gg; do _hf_cand_add "${p%/}" "${p%/}"; done
+  done
+  # 2) 家目录约定
+  _hf_cand_add "$home/.cache/huggingface" "$home"
+  _hf_cand_add "$home/huggingface"        "$home"
+  # 3) 数据盘约定：<挂载点>/<用户>/...（先用属主校验，避免清到别人的）
+  for m in "${DATA_MOUNTS[@]}"; do
+    [ -d "$m/$u" ] || continue
+    path_owned_by "$m/$u/.cache/huggingface" "$u" || continue
+    _hf_cand_add "$m/$u/.cache/huggingface" "$m/$u"
+    _hf_cand_add "$m/$u/huggingface"        "$m/$u"
+  done
+  # 4) 可选的 shell 探测（默认关；会执行别人的 profile，有挂住风险）
+  if [ "$PROBE_USER_SHELL" -eq 1 ] || [ "$HF_OUTSIDE_OK" -eq 1 ]; then
+    hf=$(user_env "$u" 'printf "%s" "${HF_HOME:-}"')
+    if [ -n "$hf" ]; then
+      if _hf_cand_add "${hf%/}" "${hf%/}"; then
+        log "   · shell 探测读到 HF_HOME=${hf}（额外纳入）"
       else
-        err "   · HF_HOME 解析为 ${hf}，不在 ${home} 之内、也无法确认为 ${u} 所有 —— 跳过。"
-        log "     （确认无误要清理就加 --allow-hf-outside-home）"
-        return 0
-      fi ;;
-  esac
-
-  # 再确认它确实长得像 HF 缓存，避免把随便一个目录当缓存清掉
-  if [ ! -d "$hf/hub" ] && [ ! -d "$hf/xet" ] && [ ! -d "$hf/assets" ] && [ ! -d "$hf/datasets" ]; then
-    warn "   · $hf 下没有 hub/xet/assets/datasets，不像 HF 缓存，跳过"
-    return 0
+        warn "   · shell 探测读到 HF_HOME=${hf}，但它不像 HF 缓存或已收录，忽略"
+      fi
+    fi
   fi
+}
 
+scan_one_hf() {   # <用户> <家目录> <HF根> <白名单根>
+  local u="$1" home="$2" hf="$3" guard="$4"
   log "   · HF 根: $hf  ($(human "$(size_kb "$hf")"))"
 
   # 1) 未完成的下载残片 —— 纯垃圾
@@ -518,25 +558,58 @@ clean_hf() {
 
   # 9) 官方 prune：删掉没有被 ref 引用的 revision，是"保模型、腾空间"的正解
   if [ "$NO_HF_PRUNE" -eq 0 ]; then
-    hf_official_prune "$u"
+    hf_official_prune "$u" "$home"
   fi
 }
 
-hf_official_prune() {
-  local u="$1"
-  # 需要新版 `hf` CLI（huggingface_hub 1.x）。旧版只有交互式 huggingface-cli
-  # delete-cache，会挂在 TUI 上等输入，所以这里刻意不去调用它。
-  if ! owner_cmd 15 "$u" bash -lc 'command -v hf >/dev/null 2>&1'; then
+# 收集该用户的全部 HF 缓存位置并逐个处理（家目录 + 数据盘可能同时有）
+clean_hf() {
+  local u="$1" home="$2" entry hf guard
+  collect_hf_candidates "$u" "$home"
+  if [ "${#HF_CANDS[@]}" -eq 0 ]; then
+    log "   · 无 HF 缓存（家目录约定与数据盘约定都没命中）"
+    if [ "$PROBE_USER_SHELL" -ne 1 ] && [ "$HF_OUTSIDE_OK" -ne 1 ]; then
+      log "     若该用户用非常规路径，加 --hf-home '/data/%u/my_hf' 或 --probe-user-shell"
+    fi
     return 0
   fi
+  [ "${#HF_CANDS[@]}" -gt 1 ] && log "   · 找到 ${#HF_CANDS[@]} 处 HF 缓存，逐个处理"
+  for entry in "${HF_CANDS[@]}"; do
+    hf="${entry%%$'\t'*}"
+    guard="${entry#*$'\t'}"
+    scan_one_hf "$u" "$home" "$hf" "$guard"
+  done
+  return 0
+}
+
+# 找该用户的 hf CLI：按路径查，不跑任何 shell。
+# 以前这里用 `bash -lc 'command -v hf'`，代价是 source 别人的 profile ——
+# 既可能挂住，也没必要，我们只是想找一个可执行文件而已。
+find_hf_bin() {   # <home>；找到则输出路径
+  local home="$1" p c
+  for p in "$home/.local/bin/hf" "$home/bin/hf"; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  for c in "${CONDA_PREFIXES[@]}"; do
+    case "$c" in "$home"/*) ;; *) continue ;; esac
+    [ -x "$c/bin/hf" ] && { printf '%s' "$c/bin/hf"; return 0; }
+  done
+  return 1
+}
+
+hf_official_prune() {
+  local u="$1" home="$2" hfbin out rc
+  hfbin=$(find_hf_bin "$home") || {
+    log "   · 未发现 hf CLI，跳过 hf cache prune（该步是可选的）"
+    return 0
+  }
   # 关键：hf cache prune 默认是交互式的（Proceed? [y/N]），必须显式加 -y，
   # 否则 </dev/null 读到 EOF 会静默放弃、什么也不做。
-  # 另外 hf 也是 Python，同样受 multiprocessing 的 CWD 问题影响，所以走 safe cwd。
-  local out rc
+  # 另外 hf 也是 Python，同样受 multiprocessing 的 CWD 问题影响，所以走 owner_cmd。
   if [ "$APPLY" -eq 1 ]; then
     # 注意：不能写成 `if cmd | sed ...` —— 管道的退出码是最后一段(sed)的，
     # 会把失败误判成成功。必须先存 $? 再打印。
-    out=$(owner_cmd 1800 "$u" bash -lc 'hf cache prune --yes' 2>&1); rc=$?
+    owner_cmd 1800 "$u" "$hfbin" cache prune --yes; rc=$?; out="$OWNER_OUT"
     printf '%s\n' "$out" | sed 's/^/     /'
     if [ "$rc" -eq 0 ]; then
       ok "   · hf cache prune --yes（保留模型，仅删 detached revision + 残片）"
@@ -545,8 +618,8 @@ hf_official_prune() {
     fi
   else
     printf '   %b--%b hf cache prune --dry-run（预览，不删）\n' "$C_DIM" "$C_RST"
-    out=$(owner_cmd 300 "$u" bash -lc 'hf cache prune --dry-run' 2>&1) || true
-    printf '%s\n' "$out" | head -n 40 | sed 's/^/     /'
+    owner_cmd 300 "$u" "$hfbin" cache prune --dry-run || true
+    printf '%s\n' "$OWNER_OUT" | head -n 40 | sed 's/^/     /'
   fi
 }
 
@@ -720,10 +793,25 @@ CONDA_CWD="/"
 # 而报错里提到的目录是管理员的、不是目标用户的 —— 极易误判成"学生的 conda 坏了"。
 # 对策：执行前切到 /。
 owner_cmd() {   # <超时秒> <owner> <cmd...>
-  # 注意：timeout 必须写在 subshell【内部】。写成 `timeout N owner_cmd ...` 是错的，
-  # 因为 timeout 是外部命令，无法调用 shell 函数（这个坑我在本脚本里已经踩过两次）。
+  # 输出收集到全局 OWNER_OUT，返回命令退出码。
+  #
+  # 【为什么必须写临时文件而不是直接输出】以属主身份跑的命令可能 source 到
+  # 该用户的 profile（例如 `bash -lc 'command -v hf'`）。profile 里若起了后台进程
+  #（监控 / ssh-agent / watchdog / 常驻服务），它会【继承本脚本的 stdout】。
+  # 于是：脚本自己早已跑完并打印"全部完成"，但管理员那侧
+  #     sudo bash clean_home_caches.sh --apply 2>&1 | tee clean_run2.log
+  # 的 tee 一直等不到 EOF —— 现象就是"卡住不动"，而真正的原因跟脚本进度无关。
+  # 把输出重定向到临时文件后，任何后台进程都只持有那个文件的 fd，影响不到我们的管道。
+  #
+  # 另外：timeout 必须在 subshell 内部（timeout 是外部命令，无法调用 shell 函数）。
   local t="$1" owner="$2"; shift 2
-  ( cd "$CONDA_CWD" 2>/dev/null || cd /; exec timeout "$t" sudo -u "$owner" -H "$@" </dev/null )
+  local tmp rc
+  tmp=$(mktemp 2>/dev/null) || { OWNER_OUT=""; return 1; }
+  ( cd "$CONDA_CWD" 2>/dev/null || cd /; exec timeout "$t" sudo -u "$owner" -H "$@" </dev/null >"$tmp" 2>&1 )
+  rc=$?
+  OWNER_OUT=$(cat "$tmp" 2>/dev/null)
+  rm -f "$tmp"
+  return $rc
 }
 
 # =============================================================================
@@ -733,6 +821,7 @@ CONDA_OUT=""       # 最近一次 conda clean 的输出
 CONDA_HOW=""       # 哪一级重试成功的
 CONDA_ERR_LOG=""   # 失败日志落盘路径，在 main 里初始化
 CONDA_PKGS_KB=0    # 所有 conda 前缀的 pkgs 体积合计（用于汇总，避免"0KB"的误导）
+OWNER_OUT=""       # owner_cmd 的输出缓冲区
 # conda 的 bin/conda、bin/pip 等脚本在创建时会把 python 解释器的【绝对路径】
 # 写死在第一行 shebang 里。目录一旦被 mv 过（很常见：/home/<u>/miniconda3
 # 搬到 /data3/<u>/miniconda3），文件还在但解释器路径已失效，exec 时内核报
@@ -769,18 +858,17 @@ try_conda_clean() {
   local p="$1" owner="$2" out rc
   CONDA_OUT=""; CONDA_HOW=""
 
-  out=$(owner_cmd 1800 "$owner" "$p/bin/conda" clean --all --yes 2>&1); rc=$?
+  owner_cmd 1800 "$owner" "$p/bin/conda" clean --all --yes; rc=$?; out="$OWNER_OUT"
   if [ "$rc" -eq 0 ]; then CONDA_OUT="$out"; CONDA_HOW="直接执行"; return 0; fi
 
   # conda 自己的崩溃报告就提示了插件可能是元凶，值得照做再试一次
-  out=$(owner_cmd 1800 "$owner" /usr/bin/env CONDA_NO_PLUGINS=true \
-        "$p/bin/conda" clean --all --yes 2>&1); rc=$?
+  owner_cmd 1800 "$owner" /usr/bin/env CONDA_NO_PLUGINS=true \
+    "$p/bin/conda" clean --all --yes; rc=$?; out="$OWNER_OUT"
   if [ "$rc" -eq 0 ]; then CONDA_OUT="$out"; CONDA_HOW="关插件重试(CONDA_NO_PLUGINS=true)成功"; return 0; fi
 
   # shebang 失效时，显式用前缀自带的 python 去跑 conda 脚本，绕过内核的 shebang 解析
   if [ -x "$p/bin/python" ] && ! conda_shebang_ok "$p"; then
-    out=$(owner_cmd 1800 "$owner" "$p/bin/python" "$p/bin/conda" \
-          clean --all --yes 2>&1); rc=$?
+    owner_cmd 1800 "$owner" "$p/bin/python" "$p/bin/conda" clean --all --yes; rc=$?; out="$OWNER_OUT"
     if [ "$rc" -eq 0 ]; then
       CONDA_OUT="$out"; CONDA_HOW="显式解释器重试成功(shebang 已失效)"; return 0
     fi
@@ -903,13 +991,17 @@ process_user() {
 #  用户枚举
 # =============================================================================
 declare -A SEEN=()
+declare -a SKIPPED_USERS=()
 declare -a USERS=()
 
 add_user() {
-  local u="$1" h="$2"
+  local u="$1" h="$2" x
   [ -n "$u" ] && [ -n "$h" ] || return 0
   [ "$u" = "root" ] && return 0
   [ -n "${SEEN[$u]:-}" ] && return 0
+  for x in "${SKIP_USERS[@]}"; do
+    if [ "$x" = "$u" ]; then SKIPPED_USERS+=("$u"); return 0; fi
+  done
   # 服务账号的家目录可能是 / 或 /nonexistent（典型：earlyoom）。
   # 放进来的后果是 "$home/.cache/pip" 变成 "//.cache/pip"，而且白名单根成了 "/"，
   # 被安全闸门拒绝后刷屏一堆 [ERR] 非法白名单根: '/'（实测在 4090gpu-01 上复现）。
@@ -973,6 +1065,10 @@ else
   printf ' 数据盘(自动探测 %s*): 未发现（要手工指定用 --data-mounts）\n' "$DATA_MOUNT_PREFIX"
 fi
 [ "$SCAN_DATA_DEPTH" -gt 0 ] && printf ' 数据盘全盘扫描深度: %s\n' "$SCAN_DATA_DEPTH"
+[ "$PROBE_USER_SHELL" -eq 1 ] && printf ' %s注意：--probe-user-shell 已开启，会执行目标用户的 login shell（可能挂住）%s\n' "$C_YEL" "$C_RST"
+if [ "${#SKIPPED_USERS[@]}" -gt 0 ]; then
+  printf ' 已按 --skip-user 排除: %s\n' "${SKIPPED_USERS[*]}"
+fi
 printf '%s\n' "============================================================"
 
 if [ "$APPLY" -eq 1 ] && [ "$NUKE_HF" -eq 1 ]; then
