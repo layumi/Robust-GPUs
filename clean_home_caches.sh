@@ -77,6 +77,10 @@ usage() {
       --deep            额外清理：HF 旧版 datasets 缓存、旧 transformers 缓存、
                         torch hub 预训练权重（都要重新下载，默认保留）
       --hf-datasets     额外清理 hub/datasets--*（已下载的数据集本体，通常最占地方）
+      --force-rm-pkgs   conda clean 失败时，直接 rm -rf <前缀>/pkgs。
+                        只对确认存在 bin/conda 的前缀生效；删 pkgs 不会破坏 envs，
+                        只是以后装包要重新下载。实测有机器上大量 conda clean 会失败，
+                        而 pkgs 常有 8~14GB 卡着不动，这个开关是兜底。
       --trash           额外清空用户回收站 ~/.local/share/Trash
       --system          额外执行 apt-get clean 与 journald vacuum（只看不动 docker）
       --no-hf-prune     不调用 HuggingFace 官方 `hf cache prune`
@@ -100,6 +104,7 @@ EOF
 
 # ------------------------------- 参数解析 -------------------------------
 APPLY=0; DEEP=0; TRASH=0; SYSTEM=0; NUKE_HF=0; NO_HF_PRUNE=0; HF_OUTSIDE_OK=0; HF_DATASETS=0
+FORCE_RM_PKGS=0
 SCAN_DATA_DEPTH=0
 DATA_MOUNT_PREFIX="/data"
 declare -a TARGET_USERS=()
@@ -143,6 +148,7 @@ while [ $# -gt 0 ]; do
     --system)      SYSTEM=1; shift ;;
     --no-hf-prune) NO_HF_PRUNE=1; shift ;;
     --hf-datasets) HF_DATASETS=1; shift ;;
+    --force-rm-pkgs) FORCE_RM_PKGS=1; shift ;;
     --allow-hf-outside-home) HF_OUTSIDE_OK=1; shift ;;
     -y|--apply)    APPLY=1; shift ;;
     -n|--dry-run)  APPLY=0; shift ;;    # 显式预演；也是默认行为，写了更不会手滑
@@ -360,6 +366,25 @@ clean_ml_caches() {
   fi
 }
 
+# 判断路径是否落在已探测到的数据盘之下
+under_data_mount() {
+  local p="$1" m
+  for m in "${DATA_MOUNTS[@]}"; do
+    case "$p" in "$m"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# 判断 $1 这段路径是否属于用户 $2：取最近的【已存在】祖先看属主。
+# 用途：区分"用户把缓存正常放到数据盘"和"环境变量异常指向了别人的目录"。
+path_owned_by() {
+  local p="$1" u="$2" q
+  q=$(readlink -f -- "$p" 2>/dev/null) || return 1
+  [ -n "$q" ] || return 1
+  while [ "$q" != "/" ] && [ ! -e "$q" ]; do q=$(dirname -- "$q"); done
+  [ "$(stat -c '%U' -- "$q" 2>/dev/null)" = "$u" ]
+}
+
 clean_hf() {
   local u="$1" home="$2"
   local hf guard
@@ -382,9 +407,15 @@ clean_hf() {
       if [ "$HF_OUTSIDE_OK" -eq 1 ]; then
         guard="$hf"
         warn "   · HF_HOME 在 $home 之外，按 --allow-hf-outside-home 放行: $hf"
+      elif under_data_mount "$hf" && path_owned_by "$hf" "$u"; then
+        # 实测（4090gpu-01, 用户 jiajun）：用户 export HF_HOME=/data/<user>/.cache/huggingface
+        # 把模型缓存放到数据盘，这是【正常配置】而不是异常。只要确认该路径属主就是
+        # 这个用户，就纳入清理；属主不符才拒绝。
+        guard="$hf"
+        log "   · HF_HOME 在数据盘且属主为 ${u}，纳入清理: ${hf}"
       else
-        err "   · HF_HOME 解析为 $hf，不在 $home 之内 —— 已跳过，避免误删他人缓存。"
-        log "     （若确认要清理该路径，请显式加 --allow-hf-outside-home）"
+        err "   · HF_HOME 解析为 ${hf}，不在 ${home} 之内、也无法确认为 ${u} 所有 —— 跳过。"
+        log "     （确认无误要清理就加 --allow-hf-outside-home）"
         return 0
       fi ;;
   esac
@@ -524,9 +555,16 @@ hf_official_prune() {
 #  /home/alice/anaconda_setup.sh 这种用户自己的脚本也叫这名 —— 只按名字删会误伤。
 # =============================================================================
 is_conda_installer() {
-  # 真安装包的文件头里一定带自解压标记
-  head -c 8192 -- "$1" 2>/dev/null \
-    | grep -qE 'MD5=|EXTRACT_|This is a self-extracting archive'
+  # 判据来自【实测抓取的真实文件头】，不是猜的。
+  # 真实 Miniconda3-latest / Anaconda3-2024.10 / Miniforge3 的头部长这样：
+  #     # Created by constructor 3.17.1
+  #     # NAME:  Miniconda3
+  #     # MD5:   ddb2c339b94d5611caee2e80194d1096      <-- 冒号 + 空格，不是等号
+  #     INSTALLER_NAME='Miniconda3'
+  # 坑：早先写成 'MD5='（等号）→ 一个真安装包都匹配不上，
+  #     实测在服务器上把 6 个真包（154MB~1GB）全误判为"不是安装包"跳过了。
+  head -c 8192 -- "$1" 2>/dev/null | grep -qE \
+    'Created by constructor|INSTALLER_NAME=|MD5:[[:space:]]*[0-9a-fA-F]{32}|This is a self-extracting archive'
 }
 
 clean_installers_in_dir() {   # $1=目录 $2=白名单根 $3=标签前缀
@@ -552,17 +590,29 @@ clean_installers_in_dir() {   # $1=目录 $2=白名单根 $3=标签前缀
 # =============================================================================
 declare -a CONDA_PREFIXES=()
 declare -a ORPHAN_PKGS=()
+declare -a CONDA_RP=()      # 与上面两个数组平行，存 realpath 用于去重
+
+_seen_prefix() {
+  local x
+  for x in "${CONDA_RP[@]}"; do [ "$x" = "$1" ] && return 0; done
+  return 1
+}
 
 add_conda_prefix() {   # 有 bin/conda 可执行 -> 进 CONDA_PREFIXES
-  local p="$1" x
+  local p="$1" rp
   [ -d "$p" ] || return 0
+  # 按 realpath 去重，不只是字符串去重：
+  # 实测服务器上 /data/juhao/miniconda3 与 /home/juhao/miniconda3 的 pkgs 大小
+  # 完全相同（都是 496.8MB），强烈提示前者是后者的符号链接。只按字符串去重
+  # 会对同一个 conda 跑两次 conda clean。
+  rp=$(readlink -f -- "$p" 2>/dev/null) || rp="$p"
   if [ -x "$p/bin/conda" ]; then
-    for x in "${CONDA_PREFIXES[@]}"; do [ "$x" = "$p" ] && return 0; done
-    CONDA_PREFIXES+=("$p")
+    _seen_prefix "$rp" && return 0
+    CONDA_PREFIXES+=("$p"); CONDA_RP+=("$rp")
   elif [ -d "$p/pkgs" ]; then
     # 没有 conda 可执行文件但有 pkgs 残留 -> 孤儿包缓存
-    for x in "${ORPHAN_PKGS[@]}"; do [ "$x" = "$p" ] && return 0; done
-    ORPHAN_PKGS+=("$p")
+    _seen_prefix "$rp" && return 0
+    ORPHAN_PKGS+=("$p"); CONDA_RP+=("$rp")
   fi
 }
 
@@ -593,7 +643,7 @@ probe_conda_global() {   # 数据盘上的共享安装 + 可选全盘扫描
   done
   if [ "$SCAN_DATA_DEPTH" -gt 0 ]; then
     for m in "${DATA_MOUNTS[@]}"; do
-      log "   · 扫描 $m（深度 $SCAN_DATA_DEPTH，可能较慢）…"
+      log "   · 扫描 ${m}（深度 ${SCAN_DATA_DEPTH}，可能较慢）…"
       while IFS= read -r -d '' p; do
         add_conda_prefix "$(dirname -- "$(dirname -- "$p")")"
       done < <(find "$m" -maxdepth "$SCAN_DATA_DEPTH" -type f -path '*/bin/conda' -print0 2>/dev/null)
@@ -601,9 +651,27 @@ probe_conda_global() {   # 数据盘上的共享安装 + 可选全盘扫描
   fi
 }
 
+# --force-rm-pkgs 的兜底动作：conda clean 失败时直接删 <prefix>/pkgs
+# 安全性：只对【确认存在 bin/conda】的前缀动手；删 pkgs 不会破坏 envs
+#（envs 里的文件是独立副本/硬链接，删掉包缓存只影响"下次装包要不要重新下载"）。
+force_rm_pkgs() {
+  local p="$1"
+  [ -d "$p/pkgs" ] || return 0
+  case "$p" in
+    ""|"/"|"/*") if [ "$p" = "/" ] || [ -z "$p" ]; then
+                   err "     拒绝过浅路径: '$p'"; return 1
+                 fi ;;
+  esac
+  if [ ! -x "$p/bin/conda" ]; then
+    err "     拒绝：$p 下没有 bin/conda，不像 conda 安装前缀"
+    return 1
+  fi
+  rm -rf -- "$p/pkgs" && ok "     已强制删除 $p/pkgs" || err "     删除失败: $p/pkgs"
+}
+
 # 全局跑一次：按前缀去重，以【前缀属主】身份执行
 clean_conda_prefixes() {
-  local p owner
+  local p owner kb_before kb_after freed out rc
   if [ "${#ORPHAN_PKGS[@]}" -gt 0 ]; then
     for p in "${ORPHAN_PKGS[@]}"; do
       purge_dir "$p/pkgs" "$p" "conda 包缓存（无 conda 可执行文件）"
@@ -617,16 +685,41 @@ clean_conda_prefixes() {
 
   for p in "${CONDA_PREFIXES[@]}"; do
     owner=$(stat -c '%U' -- "$p" 2>/dev/null || echo root)
-    log "   · $p  (属主: $owner, pkgs $(human "$(size_kb "$p/pkgs")"))"
-    if [ "$APPLY" -eq 1 ]; then
-      # timeout 不能包 shell 函数，必须是真的命令
-      if timeout 1800 sudo -u "$owner" -H "$p/bin/conda" clean --all --yes </dev/null >/dev/null 2>&1; then
-        ok "     conda clean --all --yes 完成"
-      else
-        warn "     conda clean 失败（属主 $owner 可能无可用 shell），继续"
-      fi
-    else
+    kb_before=$(size_kb "$p/pkgs")
+    log "   · $p  (属主: $owner, pkgs $(human "$kb_before"))"
+
+    if [ "$APPLY" -ne 1 ]; then
       printf '   %bDRY%b %s clean --all --yes\n' "$C_DIM" "$C_RST" "$p/bin/conda"
+      continue
+    fi
+
+    # 保留输出用于诊断。以前这里写 >/dev/null 2>&1 然后在警告里猜原因，
+    # 结果 20/23 失败却完全不知道为什么 —— 那是错误做法。
+    out=$(timeout 1800 sudo -u "$owner" -H "$p/bin/conda" clean --all --yes </dev/null 2>&1); rc=$?
+    if [ "$rc" -eq 0 ]; then
+      ok "     conda clean --all --yes 完成"
+    else
+      warn "     conda clean 失败 (exit=$rc, 属主 $owner)，原始输出末 12 行:"
+      printf '%s\n' "$out" | tail -n 12 | sed 's/^/        | /'
+      if [ "$FORCE_RM_PKGS" -eq 1 ]; then
+        warn "     --force-rm-pkgs 生效：改为直接删 $p/pkgs"
+        force_rm_pkgs "$p"
+      else
+        log "        如确认要强清：重跑并加 --force-rm-pkgs"
+      fi
+    fi
+
+    # 把 conda clean 实际回收的空间计入总量（以前漏算，汇总里的数字偏小）
+    kb_after=$(size_kb "$p/pkgs")
+    if [ "$kb_after" -lt "$kb_before" ]; then
+      freed=$((kb_before - kb_after))
+      TOTAL_KB=$((TOTAL_KB + freed))
+      TOTAL_ITEMS=$((TOTAL_ITEMS + 1))
+      printf '   %bDEL%b %10s  %s/pkgs  (conda clean 回收)\n' \
+             "$C_RED" "$C_RST" "$(human "$freed")" "$p"
+    else
+      printf '   %b---%b %10s  %s/pkgs  (conda clean 未回收空间)\n' \
+             "$C_DIM" "$C_RST" "$(human "$kb_after")" "$p"
     fi
   done
   return 0
@@ -684,6 +777,10 @@ add_user() {
   [ -n "$u" ] && [ -n "$h" ] || return 0
   [ "$u" = "root" ] && return 0
   [ -n "${SEEN[$u]:-}" ] && return 0
+  # 服务账号的家目录可能是 / 或 /nonexistent（典型：earlyoom）。
+  # 放进来的后果是 "$home/.cache/pip" 变成 "//.cache/pip"，而且白名单根成了 "/"，
+  # 被安全闸门拒绝后刷屏一堆 [ERR] 非法白名单根: '/'（实测在 4090gpu-01 上复现）。
+  case "$h" in ""|"/"|"/nonexistent"|"/nonexistent/"*) return 0 ;; esac
   [ -d "$h" ] || return 0
   SEEN[$u]=1
   USERS+=("$u|$h")
@@ -707,6 +804,11 @@ else
     [ "$uid" -ge 1000 ] || continue
     [ "$uid" -eq 65534 ] && continue
     [ "$uid" -eq 4294967294 ] && continue
+    # 自动枚举时跳过服务账号（nologin / false）。它们的家目录里不会有缓存，
+    # 只会制造噪声（earlyoom 就是这一类）。真要处理就用 -u 显式指定。
+    case "${_shell:-}" in
+      *nologin|*false) continue ;;
+    esac
     add_user "$_name" "$uhome"
   done < <(getent passwd 2>/dev/null || cat /etc/passwd)
   # 2) /home 下存在但没有 passwd 记录的目录（兜底，兼容原脚本行为）
@@ -729,8 +831,8 @@ collect_data_mounts
 printf '%s\n' "============================================================"
 printf ' clean_home_caches.sh  模式: %s\n' \
   "$([ "$APPLY" -eq 1 ] && echo "${C_RED}APPLY（真删）${C_RST}" || echo "${C_GRN}DRY-RUN（只报告）${C_RST}")"
-printf ' 额外开关: --deep=%s  --trash=%s  --system=%s  --nuke-hf=%s  --hf-datasets=%s\n' \
-  "$DEEP" "$TRASH" "$SYSTEM" "$NUKE_HF" "$HF_DATASETS"
+printf ' 额外开关: --deep=%s  --trash=%s  --system=%s  --nuke-hf=%s  --hf-datasets=%s  --force-rm-pkgs=%s\n' \
+  "$DEEP" "$TRASH" "$SYSTEM" "$NUKE_HF" "$HF_DATASETS" "$FORCE_RM_PKGS"
 printf ' 待处理用户: %s\n' "${#USERS[@]}"
 if [ "${#DATA_MOUNTS[@]}" -gt 0 ]; then
   printf ' 数据盘(自动探测 %s*): %s\n' "$DATA_MOUNT_PREFIX" "${DATA_MOUNTS[*]}"
