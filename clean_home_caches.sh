@@ -77,10 +77,10 @@ usage() {
       --deep            额外清理：HF 旧版 datasets 缓存、旧 transformers 缓存、
                         torch hub 预训练权重（都要重新下载，默认保留）
       --hf-datasets     额外清理 hub/datasets--*（已下载的数据集本体，通常最占地方）
-      --force-rm-pkgs   conda clean 失败时，直接 rm -rf <前缀>/pkgs。
-                        只对确认存在 bin/conda 的前缀生效；删 pkgs 不会破坏 envs，
-                        只是以后装包要重新下载。实测有机器上大量 conda clean 会失败，
-                        而 pkgs 常有 8~14GB 卡着不动，这个开关是兜底。
+      --force-rm-pkgs   兜底开关：仅当 conda clean 失败时，改为 rm -rf <前缀>/pkgs。
+                        注意它【不是】conda clean —— 手段更粗暴，不区分包有没有被引用。
+                        删前会检查 env 里有没有指向 pkgs 的符号链接（conda 跨文件系统时
+                        会退化成软链接），有就拒绝。硬链接/副本两种模式下 env 不受影响。
       --trash           额外清空用户回收站 ~/.local/share/Trash
       --system          额外执行 apt-get clean 与 journald vacuum（只看不动 docker）
       --no-hf-prune     不调用 HuggingFace 官方 `hf cache prune`
@@ -651,20 +651,55 @@ probe_conda_global() {   # 数据盘上的共享安装 + 可选全盘扫描
   fi
 }
 
+# 检查某个 conda 前缀的 env 里，有没有【符号链接】指向该前缀的 pkgs。
+#
+# 为什么必须查：conda 装包时优先用硬链接（hardlink），硬链接失败才退化为
+# 符号链接或直接拷贝。env 与 pkgs 在不同文件系统上时就可能退化为软链接
+# （例如 conda 装在 /home，而环境用 `conda create -p /data/xxx/env` 建在 /data）。
+#   - 硬链接：删 pkgs 只是减一次链接计数，env 里的实体文件还在 → 安全
+#   - 拷贝：  env 是独立副本 → 安全
+#   - 软链接：env 里是指向 pkgs 的链接 → 删 pkgs 会让 env 全部断链 → 【会坏】
+# 所以这里只对前两种放行。
+pkgs_symlink_in_env() {
+  local p="$1" d hit
+  for d in "$p/envs" "$p/lib" "$p/lib64"; do
+    [ -d "$d" ] || continue
+    hit=$(find "$d" -type l -lname "$p/pkgs/*" -print -quit 2>/dev/null)
+    [ -z "$hit" ] && hit=$(find "$d" -type l -lname "*pkgs/*" -print -quit 2>/dev/null)
+    [ -n "$hit" ] && { printf '%s' "$hit"; return 0; }
+  done
+  return 1
+}
+
+# 采样看 env 里的实体文件是否为硬链接（link count > 1），用于给出更确定的结论
+env_uses_hardlinks() {
+  local p="$1" f n
+  f=$(find "$p/envs" "$p/lib" -type f -print -quit 2>/dev/null)
+  [ -n "$f" ] || return 1
+  n=$(stat -c '%h' -- "$f" 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -gt 1 ]
+}
+
 # --force-rm-pkgs 的兜底动作：conda clean 失败时直接删 <prefix>/pkgs
-# 安全性：只对【确认存在 bin/conda】的前缀动手；删 pkgs 不会破坏 envs
-#（envs 里的文件是独立副本/硬链接，删掉包缓存只影响"下次装包要不要重新下载"）。
 force_rm_pkgs() {
-  local p="$1"
+  local p="$1" link
   [ -d "$p/pkgs" ] || return 0
-  case "$p" in
-    ""|"/"|"/*") if [ "$p" = "/" ] || [ -z "$p" ]; then
-                   err "     拒绝过浅路径: '$p'"; return 1
-                 fi ;;
-  esac
   if [ ! -x "$p/bin/conda" ]; then
     err "     拒绝：$p 下没有 bin/conda，不像 conda 安装前缀"
     return 1
+  fi
+  if link=$(pkgs_symlink_in_env "$p"); then
+    err "     拒增强删：env 里存在指向 pkgs 的符号链接，删了会断链"
+    err "       例: ${link}"
+    err "       说明这个环境的 conda 走了软链接回退（env 与 pkgs 可能跨文件系统）"
+    err "       该前缀请保持原样，或让属主自行处理"
+    return 1
+  fi
+  if env_uses_hardlinks "$p"; then
+    log "     已确认 env 与 pkgs 是硬链接关系，删 pkgs 不影响 env 里的文件"
+  else
+    log "     env 里未发现指向 pkgs 的链接（应为独立副本），删 pkgs 不影响 env"
   fi
   rm -rf -- "$p/pkgs" && ok "     已强制删除 $p/pkgs" || err "     删除失败: $p/pkgs"
 }
